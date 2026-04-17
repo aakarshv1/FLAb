@@ -12,7 +12,7 @@ from scipy.stats import pearsonr
 from scipy.stats import spearmanr
 from scipy.stats import kendalltau
 
-from models import iglm_score,antiberty_score,progen_score
+from models import iglm_score,antiberty_score,progen_score,ctmc_score
 from extra import dir_create
 
 """
@@ -43,9 +43,11 @@ def _get_args():
                       default=None,
                       nargs='?',
                       help="specific progen model (ex: small).")
+    
+    parser.add_argument("log_transform", type=bool, default=False, nargs='?', help="whether to log transform fitness metric for plotting and correlation")
 
     parser.add_argument("device",
-                      default='cpu',
+                      default='cuda:0',
                       nargs='?',
                       help="specify whether using cpu (default) or gpu (cuda:0)")
     return parser.parse_args()
@@ -112,16 +114,22 @@ def _cli():
 
     elif score_method == 'antiberty':
         df = antiberty_score(df)
-    
+
     elif score_method == 'progen':
         df = progen_score(df, progen_model, device)
+
+    elif score_method == 'ctmc':
+        df = ctmc_score(df, device=device)
 
     # PLOT PERPLEXITY
 
     # Determine x axis
     if fitness_dir == 'binding':
         fitness_metric = 'negative log Kd'
-        df[fitness_metric] = -np.log(df['fitness'])
+        if args.log_transform:
+            df[fitness_metric] = -np.log(df['fitness'])
+        else:
+            df[fitness_metric] = df['fitness']
 
     elif fitness_dir == 'immunogenicity':
         fitness_metric = 'immunogenic response (%)'
@@ -141,6 +149,11 @@ def _cli():
 
     elif fitness_dir == 'polyreactivity':
         fitness_metric = 'polyreactivity metric'
+        df[fitness_metric] = df['fitness']
+
+    else:
+        # Default case for unknown fitness directories
+        fitness_metric = 'fitness'
         df[fitness_metric] = df['fitness']
 
     df['is_first_row'] = df.index == 0

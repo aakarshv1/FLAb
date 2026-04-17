@@ -1,0 +1,4 @@
+correlation_name,value,p-value
+pearson,0.3816085055430639,0.0
+spearman,0.4565889221833439,0.0
+kendal tau,0.316739137198557,0.0

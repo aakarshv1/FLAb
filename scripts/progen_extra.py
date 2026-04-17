@@ -6,7 +6,12 @@ import sys
 import torch
 
 from tokenizers import Tokenizer
-sys.path.append('/home/mchungy1/scr16_jgray21/mchungy1')
+
+# Add progen submodule to path (relative to this script)
+progen_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if progen_path not in sys.path:
+    sys.path.insert(0, progen_path)
+
 from progen.progen2.models.progen.modeling_progen import ProGenForCausalLM
 
 import subprocess
@@ -40,10 +45,29 @@ def set_seed(seed, deterministic=True):
 
 ### models
 def create_model(ckpt, fp16=True):
+    # Check if using HuggingFace model (contains '/')
+    is_hf_model = '/' in ckpt
+
     if fp16:
-        return ProGenForCausalLM.from_pretrained(ckpt, revision='float16', torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        if is_hf_model:
+            # HuggingFace models don't have float16 revision, load in fp32 and convert
+            return ProGenForCausalLM.from_pretrained(
+                ckpt,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+        else:
+            # Local checkpoints may have float16 revision
+            return ProGenForCausalLM.from_pretrained(
+                ckpt,
+                revision='float16',
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
     else:
-        return ProGenForCausalLM.from_pretrained(ckpt)
+        kwargs = {'trust_remote_code': True} if is_hf_model else {}
+        return ProGenForCausalLM.from_pretrained(ckpt, **kwargs)
 
 def create_tokenizer_custom(file):
     with open(file, 'r') as f:

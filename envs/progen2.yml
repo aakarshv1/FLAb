@@ -1,0 +1,21 @@
+name: progen2
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - cudatoolkit=11.3
+  - pytorch=1.10.1
+  - torchvision=0.11.2
+  - torchaudio=0.10.1
+  - pip:
+      - transformers==4.16.2
+      - fire==0.4.0
+      - datasets==1.18.3
+      - tokenizers==0.10.3
+      - tqdm==4.62.3
+      - numpy==1.21.5
+      - git+https://github.com/enijkamp/progen2.git

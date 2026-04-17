@@ -21,9 +21,10 @@ except ImportError:
 # progen
 try:
     from progen_extra import *
-
-except ImportError:
-    pass
+    PROGEN_AVAILABLE = True
+except ImportError as e:
+    PROGEN_AVAILABLE = False
+    print(f"ProGen not available: {e}")
 
 # esm if
 try:
@@ -62,6 +63,247 @@ try:
 
 except ImportError:
     pass
+
+# CTMC
+try:
+    import sys
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from tqdm import tqdm
+
+    # Add PEINT to path
+    peint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    if peint_path not in sys.path:
+        sys.path.insert(0, peint_path)
+
+    from peint.models.modules.ctmc_module import CTMCModule
+    from evo.dataset import ComplexCherriesDataset
+    from evo.dms import get_site_by_site_consensus
+    from peint.data.datasets.ctmc import CTMCDataset
+    from peint.data.datamodule import PLMRDataModule
+
+    CTMC_AVAILABLE = True
+except ImportError as e:
+    CTMC_AVAILABLE = False
+    print(f"CTMC not available: {e}")
+
+
+def _score_pairs_batch_ctmc(heavy_seqs, light_seqs, df, ctmc_module, vocab, device, batch_size=32):
+    """
+    Score a batch of paired antibody sequences using CTMC stationary distribution.
+
+    This directly adapts DMSAnalyzer._run_ctmc_inference() for paired chains.
+
+    Args:
+        heavy_seqs: List of heavy chain AA sequences
+        light_seqs: List of light chain AA sequences
+        df: DataFrame with columns ['heavy', 'light', 'fitness'] for computing consensus
+        ctmc_module: Loaded CTMCModule
+        vocab: Vocabulary from ctmc_module.net.vocab
+        device: Device for inference
+        batch_size: Batch size for inference
+
+    Returns:
+        Tuple of (heavy_perplexities, light_perplexities)
+    """
+    import tempfile
+
+    # Compute consensus sequences from DataFrame
+    consensus_heavy = get_site_by_site_consensus(df, 'heavy')
+    consensus_light = get_site_by_site_consensus(df, 'light')
+
+    # Build transition strings (consensus -> variant at t=inf)
+    # Format: "CONSENSUS_HEAVY.CONSENSUS_LIGHT HEAVY.LIGHT inf" (matches DMSAnalyzer format)
+    transitions = [f"{consensus_heavy}.{consensus_light} {h}.{l} inf" for h, l in zip(heavy_seqs, light_seqs)]
+
+    # Write to temp file (same format as DMSAnalyzer uses)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(f"{len(transitions)} transitions\n")
+        f.write("\n".join(transitions))
+        temp_file = f.name
+
+    try:
+        # Create dataset (chain_id_offset=1 for paired chains, with separator)
+        dataset = ComplexCherriesDataset(
+            data_file=temp_file,
+            min_t=0.,
+            chain_id_offset=1,  # Paired chains
+        )
+
+        # Create CTMC dataset
+        ctmc_dataset = CTMCDataset(
+            dataset=dataset,
+            sep_token=".",  # Separator for paired chains
+            vocab=vocab,
+        )
+
+        # Create dataloader
+        dataloader = PLMRDataModule(
+            dataset=ctmc_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )._dataloader_template(dataset=ctmc_dataset, training=False)
+
+        # Run inference
+        heavy_lls = []
+        light_lls = []
+        vocab_pad_idx = vocab.pad_idx
+
+        # Build special token mask
+        special_tok_idxs = [
+            vocab.bos_idx, vocab.pad_idx, vocab.eos_idx, vocab.unk_idx, vocab.mask_idx,
+            vocab.tokens_to_idx.get("<null_1>", -1),
+            vocab.tokens_to_idx.get(".", -1),  # Chain separator
+            vocab.tokens_to_idx.get("X", -1),
+            vocab.tokens_to_idx.get("B", -1),
+            vocab.tokens_to_idx.get("Z", -1),
+            vocab.tokens_to_idx.get("O", -1),
+            vocab.tokens_to_idx.get("U", -1),
+        ]
+        special_tok_idxs = torch.tensor(special_tok_idxs, device=device)
+        sep_token_idx = vocab.tokens_to_idx.get(".", -1)
+
+        for batch in tqdm(dataloader, desc="CTMC scoring", disable=False):
+            # Move batch to device first, then unpack (matches DMSAnalyzer pattern)
+            batch = [b.to(device) for b in batch]
+            x, y, t, x_sizes = batch
+
+            with torch.no_grad(), torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
+                # Compute stationary distribution
+                Q, pi = ctmc_module.net(x, x_sizes=x_sizes)
+                # Use stationary distribution instead of transition matrix
+                log_probs = torch.log(pi).clamp(min=-1e10)
+
+            # Compute NLL
+            nll = F.cross_entropy(
+                log_probs.transpose(-1, -2),
+                y,
+                ignore_index=vocab_pad_idx,
+                reduction="none",
+            )
+
+            # Mask out special tokens (only count amino acid tokens)
+            aa_tok_mask = torch.isin(y, special_tok_idxs, invert=True)
+
+            # Split by chain: find separator token position
+            for b in range(y.size(0)):  # Iterate over batch
+                seq_y = y[b]
+                seq_nll = nll[b]
+                seq_aa_mask = aa_tok_mask[b]
+
+                # Find separator position
+                sep_positions = (seq_y == sep_token_idx).nonzero(as_tuple=True)[0]
+
+                if len(sep_positions) > 0:
+                    sep_idx = sep_positions[0].item()
+
+                    # Heavy chain: positions before separator
+                    heavy_mask = seq_aa_mask.clone()
+                    heavy_mask[sep_idx:] = False  # Mask out separator and light chain
+
+                    # Light chain: positions after separator
+                    light_mask = seq_aa_mask.clone()
+                    light_mask[:sep_idx+1] = False  # Mask out heavy chain and separator
+
+                    # Compute log-likelihoods
+                    heavy_ll = (-seq_nll * heavy_mask.float()).sum().item()
+                    light_ll = (-seq_nll * light_mask.float()).sum().item()
+
+                else:
+                    # No separator found (shouldn't happen for paired scoring)
+                    print("No separator found for sequence: ", seq_y)
+                    total_ll = (-seq_nll * seq_aa_mask.float()).sum().item()
+                    heavy_ll = total_ll
+                    light_ll = 0.0
+
+                heavy_lls.append(heavy_ll)
+                light_lls.append(light_ll)
+
+        # Compute perplexities correctly for paired sequences
+        # Sum log-likelihoods across both chains, then normalize by total length
+        heavy_perplexities = []
+        light_perplexities = []
+        paired_perplexities = []
+
+        for i, (heavy_seq, light_seq) in enumerate(zip(heavy_seqs, light_seqs)):
+            total_len = len(heavy_seq) + len(light_seq)
+
+            # For paired sequences: sum LLs across both chains, normalize by total length
+            total_ll = heavy_lls[i] + light_lls[i]
+            paired_ppl = math.exp(-total_ll / total_len)
+
+            # Also compute per-chain perplexities (for analysis/debugging)
+            heavy_ppl = math.exp(-heavy_lls[i] / total_len)
+            light_ppl = math.exp(-light_lls[i] / total_len)
+
+            heavy_perplexities.append(heavy_ppl)
+            light_perplexities.append(light_ppl)
+            paired_perplexities.append(paired_ppl)
+
+        return heavy_perplexities, light_perplexities, paired_perplexities
+
+    finally:
+        os.unlink(temp_file)
+
+
+def ctmc_score(df, ckpt_path=None, device="cuda", batch_size=32):
+    """
+    Score antibody sequences using CTMC stationary distribution.
+
+    Args:
+        df: DataFrame with columns ['heavy', 'light', 'fitness']
+        ckpt_path: Path to CTMC checkpoint (default: from CTMC_CHECKPOINT_PATH env var)
+        device: Device for inference (default: "cuda")
+        batch_size: Batch size for inference (default: 32)
+
+    Returns:
+        df with added columns ['heavy_perplexity', 'light_perplexity', 'average_perplexity']
+    """
+    if not CTMC_AVAILABLE:
+        raise ImportError(
+            "CTMC not available. Ensure PEINT is installed and importable."
+        )
+
+    # Load checkpoint
+    if ckpt_path is None:
+        ckpt_path = os.environ.get("CTMC_CHECKPOINT_PATH")
+        if ckpt_path is None:
+            raise ValueError(
+                "Must provide ckpt_path argument or set CTMC_CHECKPOINT_PATH environment variable.\n"
+                "Example: export CTMC_CHECKPOINT_PATH=/path/to/checkpoint.ckpt"
+            )
+
+    print(f"Loading CTMC checkpoint from: {ckpt_path}")
+
+    # Load model and move to device
+    ctmc_module = CTMCModule.load_from_checkpoint(ckpt_path)
+    ctmc_module = ctmc_module.eval().to(device)
+    print("Device: ", device)
+    vocab = ctmc_module.net.vocab
+
+    # Score paired heavy and light chains
+    print(f"Scoring {len(df)} paired antibody sequences...")
+    heavy_perplexities, light_perplexities, paired_perplexities = _score_pairs_batch_ctmc(
+        df['heavy'].tolist(),
+        df['light'].tolist(),
+        df,
+        ctmc_module,
+        vocab,
+        device,
+        batch_size
+    )
+
+    # Add to dataframe (matching FLAb's expected column names)
+    df['heavy_perplexity'] = heavy_perplexities
+    df['light_perplexity'] = light_perplexities
+    # Use the correctly computed paired perplexity (sum of LLs, normalized by total length)
+    df['average_perplexity'] = paired_perplexities
+
+    print(f"Scored {len(df)} sequences. Average perplexity: {df['average_perplexity'].mean():.3f}")
+
+    return df
 
 
 def iglm_score(df):
@@ -146,6 +388,11 @@ def antiberty_score(df):
     return df
 
 def progen_score(df, model_version, device):
+    if not PROGEN_AVAILABLE:
+        raise ImportError(
+            "ProGen not available. Ensure progen_extra module and its dependencies are properly installed."
+        )
+
     ### main
     # (0) constants
 
@@ -167,7 +414,16 @@ def progen_score(df, model_version, device):
         print('falling back to cpu')
 
     device = torch.device(device)
-    ckpt = f"/home/mchungy1/scr16_jgray21/mchungy1/progen/progen2/checkpoints/progen2-{model_version}"
+
+    # Use HuggingFace model names or environment variable for local checkpoint
+    ckpt = os.environ.get('PROGEN_CHECKPOINT_PATH')
+    if ckpt is None:
+        # Use official HuggingFace model names
+        ckpt = f"hugohrban/progen2-{model_version}"
+        print(f"Using HuggingFace checkpoint: {ckpt}")
+    else:
+        ckpt = f"{ckpt}/progen2-{model_version}"
+        print(f"Using local checkpoint: {ckpt}")
 
     if device.type == 'cpu':
         print('falling back to fp32')
@@ -178,7 +434,9 @@ def progen_score(df, model_version, device):
 
 
     with print_time('loading tokenizer'):
-        tokenizer = create_tokenizer_custom(file='/home/mchungy1/scr16_jgray21/mchungy1/progen/progen2/tokenizer.json')
+        # Use tokenizer from progen submodule
+        tokenizer_path = os.path.join(os.path.dirname(__file__), '..', 'progen', 'progen2', 'tokenizer.json')
+        tokenizer = create_tokenizer_custom(file=tokenizer_path)
 
     def ce(tokens):
         with torch.no_grad():

@@ -2,6 +2,7 @@ name: /scratch16/jgray21/mchungy1/conda_envs/progen
 channels:
   - pytorch
   - defaults
+  - conda-forge
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
@@ -13,7 +14,7 @@ dependencies:
   - libstdcxx-ng=11.2.0=h1234567_1
   - ncurses=6.4=h6a678d5_0
   - openssl=1.1.1t=h7f8727e_0
-  - python=3.8.16=h7a1cb2a_3
+  - python=3.9
   - readline=8.2=h5eee18b_0
   - sqlite=3.41.2=h5eee18b_0
   - tk=8.6.12=h1ccaba5_0

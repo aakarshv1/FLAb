@@ -1,0 +1,3 @@
+[submodule "progen"]
+	path = progen
+	url = https://github.com/salesforce/progen.git
